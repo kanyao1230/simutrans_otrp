@@ -4357,6 +4357,97 @@ bool rail_vehicle_t::can_enter_tile(const grund_t *gr, sint32 &restart_speed, ui
 		return false;
 	}
 
+	// On YELLOW pass: pre-reserve one block ahead (next_stop_index == terminal+1).
+	// On GREEN pass: scan ahead through consecutive priority signals; if a YELLOW is
+	// found in the cascade the same pre-reserve is performed (next_stop_index is still
+	// terminal+1 because the cascade leaves it unchanged when propagating GREEN upward).
+	// On success the YELLOW signal is updated to GREEN so subsequent signals in the same
+	// cascade do not re-attempt the extension.
+	if(  w->has_signal()  ) {
+		signal_t *sig_pass = gr->find<signal_t>();
+		if(  sig_pass  &&  sig_pass->get_desc()->is_priority_signal()  ) {
+			signal_t *yellow_sig = NULL;
+			if(  sig_pass->get_state() == roadsign_t::STATE_YELLOW  ) {
+				yellow_sig = sig_pass;
+			}
+			else if(  sig_pass->get_state() == roadsign_t::STATE_GREEN  ) {
+				for(  uint16 j = route_index + 1;  j < cnv->get_route()->get_count();  j++  ) {
+					grund_t *gj = welt->lookup( cnv->get_route()->at(j) );
+					if(  gj == NULL  ) { break; }
+					schiene_t *schj = (schiene_t *)gj->get_weg( get_waytype() );
+					if(  schj == NULL  ) { break; }
+					if(  !schj->has_signal()  ) { continue; }
+					signal_t *sig_j = gj->find<signal_t>();
+					if(  sig_j == NULL  ) { break; }
+					if(  !sig_j->get_desc()->is_priority_signal()  ) { break; }
+					if(  sig_j->get_state() == roadsign_t::STATE_YELLOW  ) {
+						yellow_sig = sig_j;
+						break;
+					}
+					// GREEN priority signal: continue scanning
+				}
+			}
+			if(  yellow_sig != NULL  ) {
+				uint16 const res_idx = cnv->get_next_stop_index();
+				uint16 ext_signal, ext_crossing;
+				if(  res_idx > route_index  &&  res_idx < cnv->get_route()->get_count()  ) {
+					// Find terminal signal before reservation so we can check pre-signal conditions.
+					signal_t *sig_terminal = NULL;
+					if(  res_idx > 0  ) {
+						grund_t *gr_t = welt->lookup( cnv->get_route()->at(res_idx - 1) );
+						sig_terminal = gr_t ? gr_t->find<signal_t>() : NULL;
+					}
+					// For pre-signals: only reserve when S2→S3 is also clear.
+					bool do_reserve = true;
+					if(  sig_terminal  &&  sig_terminal->get_desc()->is_pre_signal()  ) {
+						uint16 dry_ext_sig = cnv->get_route()->get_count();
+						uint16 dry_ext_cross = cnv->get_route()->get_count();
+						if(  block_reserver( cnv->get_route(), res_idx, dry_ext_sig, dry_ext_cross, 0, false, false )  ) {
+							// dry_ext_sig is S2; check S2→S3
+							if(  dry_ext_sig + 1 < cnv->get_route()->get_count()  ) {
+								uint16 dry2_ext_sig = 0, dry2_ext_cross = 0;
+								if(  !block_reserver( cnv->get_route(), dry_ext_sig + 1, dry2_ext_sig, dry2_ext_cross, 0, false, false )  ) {
+									do_reserve = false;
+								}
+							}
+						}
+						else {
+							do_reserve = false;
+						}
+					}
+					if(  do_reserve  ) {
+						if(  block_reserver( cnv->get_route(), res_idx, ext_signal, ext_crossing, 0, true, false )  ) {
+							yellow_sig->set_state( roadsign_t::STATE_GREEN );
+							uint16 const next_sig = min( ext_signal, ext_crossing );
+							if(  sig_terminal  ) {
+								if(  sig_terminal->get_desc()->is_priority_signal()  ) {
+									// Priority signal: GREEN or YELLOW depending on next_sig's state.
+									if(  next_sig < cnv->get_route()->get_count()  ) {
+										sint32 dummy = -1;
+										if(  is_signal_clear( next_sig, dummy, false )  ) {
+											sig_terminal->set_state( roadsign_t::STATE_GREEN );
+										}
+										else {
+											sig_terminal->set_state( roadsign_t::STATE_YELLOW );
+											cnv->set_next_stop_index( next_sig );
+										}
+									}
+									else {
+										sig_terminal->set_state( roadsign_t::STATE_GREEN );
+									}
+								}
+								else {
+									// Block/longblock/pre-signal: block was just reserved, show GREEN.
+									sig_terminal->set_state( roadsign_t::STATE_GREEN );
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// is there any signal/crossing to be reserved?
 	uint16 next_block = cnv->get_next_stop_index()-1;
 	if(  next_block >= cnv->get_route()->get_count()  ) {
